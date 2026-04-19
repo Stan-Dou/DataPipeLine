@@ -1,0 +1,333 @@
+:root {
+  --bg: #f5f1e8;
+  --panel: #fffaf0;
+  --ink: #172126;
+  --muted: #66727b;
+  --line: #d4c8b0;
+  --accent: #0f6d73;
+  --accent-2: #c65d2e;
+  --danger: #a33d2f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top right, rgba(15, 109, 115, 0.12), transparent 30%),
+    radial-gradient(circle at bottom left, rgba(198, 93, 46, 0.14), transparent 25%),
+    var(--bg);
+}
+
+.app-shell {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.topbar,
+.control-card,
+.line-card,
+.chart-card {
+  background: rgba(255, 250, 240, 0.95);
+  border: 1px solid rgba(212, 200, 176, 0.85);
+  border-radius: 18px;
+  box-shadow: 0 18px 40px rgba(68, 55, 34, 0.08);
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: flex-start;
+  padding: 24px;
+  margin-bottom: 18px;
+}
+
+.topbar h1,
+.control-header h2,
+.chart-title-row h2 {
+  margin: 0;
+}
+
+.topbar p,
+.control-header p,
+.chart-note,
+#status-text {
+  color: var(--muted);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.control-card,
+.line-card,
+.chart-card {
+  padding: 18px;
+}
+
+.controls-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+}
+
+label span {
+  font-weight: 600;
+}
+
+select,
+button {
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  font-size: 14px;
+  background: #fffdf8;
+  color: var(--ink);
+}
+
+button {
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  color: #f9fffd;
+  border-color: var(--accent);
+}
+
+button.secondary {
+  background: transparent;
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+.action-cell {
+  display: flex;
+  height: 100%;
+  align-items: end;
+}
+
+.workspace-grid {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.line-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.line-item {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.group-item {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.group-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.group-summary {
+  flex: 1;
+}
+
+.group-toggle {
+  min-width: 88px;
+}
+
+.group-name {
+  font-weight: 800;
+}
+
+.group-meta {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 6px;
+}
+
+.group-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.group-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(212, 200, 176, 0.9);
+}
+
+.group-lines.collapsed {
+  display: none;
+}
+
+.line-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(245, 241, 232, 0.65);
+}
+
+.line-row-main {
+  min-width: 0;
+}
+
+.line-row-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.line-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.line-name {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.line-meta {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 6px;
+}
+
+.line-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.chart-stack {
+  display: grid;
+  gap: 18px;
+}
+
+.chart-title-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.chart-panel {
+  position: relative;
+  min-height: 220px;
+}
+
+.chart-svg {
+  width: 100%;
+  height: 220px;
+  display: block;
+  overflow: visible;
+}
+
+.axis-label,
+.tick-label {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.grid-line {
+  stroke: rgba(102, 114, 123, 0.18);
+  stroke-width: 1;
+}
+
+.axis-line {
+  stroke: rgba(23, 33, 38, 0.4);
+  stroke-width: 1;
+}
+
+.crosshair-line {
+  stroke: rgba(23, 33, 38, 0.45);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(23, 33, 38, 0.92);
+  color: #fff;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  min-width: 180px;
+  box-shadow: 0 16px 30px rgba(0, 0, 0, 0.2);
+}
+
+.tooltip-hidden {
+  display: none;
+}
+
+.empty-state {
+  color: var(--muted);
+  padding: 16px 0;
+}
+
+@media (max-width: 1100px) {
+  .controls-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 700px) {
+  .app-shell {
+    padding: 14px;
+  }
+
+  .topbar {
+    flex-direction: column;
+  }
+
+  .controls-grid {
+    grid-template-columns: 1fr;
+  }
+}

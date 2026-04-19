@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Options OI Viewer</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>Options OI Viewer</h1>
+        <p>Local dashboard for closing price, OI, and settlement trends.</p>
+      </div>
+      <div class="toolbar">
+        <button id="sync-button" class="primary">Sync</button>
+        <span id="status-text">Loading metadata...</span>
+      </div>
+    </header>
+
+    <section class="control-card">
+      <div class="control-header">
+        <h2>Add Group</h2>
+        <p>Keep company, expiry, and type fixed. Add every strike between the two selected endpoints as one tracked group.</p>
+      </div>
+      <div class="controls-grid">
+        <label>
+          <span>Company</span>
+          <select id="company-select"></select>
+        </label>
+        <label>
+          <span>Expiry</span>
+          <select id="expiry-select"></select>
+        </label>
+        <label>
+          <span>Type</span>
+          <select id="type-select"></select>
+        </label>
+        <label>
+          <span>Strike Start</span>
+          <select id="strike-start-select"></select>
+        </label>
+        <label>
+          <span>Strike End</span>
+          <select id="strike-end-select"></select>
+        </label>
+        <label>
+          <span>Range</span>
+          <select id="range-select">
+            <option value="all">All</option>
+            <option value="90">Last 90 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </label>
+        <div class="action-cell">
+          <button id="add-group-button" class="primary">Add Group</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="workspace-grid">
+      <aside class="line-card">
+        <div class="control-header">
+          <h2>Tracked Groups</h2>
+          <p>Hide or remove an entire strike range, or control individual lines inside the group.</p>
+        </div>
+        <div id="line-list" class="line-list empty-state">No contract lines added yet.</div>
+      </aside>
+
+      <main class="chart-stack">
+        <section class="chart-card">
+          <div class="chart-title-row">
+            <h2>Closing Price (HKD)</h2>
+            <span class="chart-note">One line per company currently represented on the page</span>
+          </div>
+          <div id="price-chart" class="chart-panel"></div>
+        </section>
+        <section class="chart-card">
+          <div class="chart-title-row">
+            <h2>Open Interest (Contracts)</h2>
+            <span class="chart-note">Contract lines, measured in contracts</span>
+          </div>
+          <div id="oi-chart" class="chart-panel"></div>
+        </section>
+        <section class="chart-card">
+          <div class="chart-title-row">
+            <h2>Settlement (HKD)</h2>
+            <span class="chart-note">Settlement trend per tracked contract</span>
+          </div>
+          <div id="settlement-chart" class="chart-panel"></div>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
