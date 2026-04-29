@@ -1,4 +1,4 @@
-"""中证红利50指数爬虫 - 支持 CSI官网源 和 AKShare源
+"""中证红利类指数爬虫 - 支持 CSI官网源 和 AKShare源
 
 用法：
     scraper = CSIDividend50Scraper(source="akshare")   # AKShare源（推荐）
@@ -7,7 +7,7 @@
     # 获取行情数据
     records = scraper.run(start_date="20200101", end_date="20260429")
 
-    # 获取估值数据（仅AKShare源支持）
+    # 获取估值数据（优先使用中证官方源）
     valuations = scraper.fetch_valuation()
 """
 
@@ -22,21 +22,21 @@ logger = logging.getLogger(__name__)
 
 # 常用红利类指数代码表
 KNOWN_INDICES = {
-    "000922": "中证红利50",
+    "000922": "中证红利",
     "H30269": "中证红利低波",
     "930955": "中证红利低波100",
     "000015": "上证红利",
     "399324": "深证红利",
-    "000821": "高股息",
-    "H30533": "中证红利100",
+    "000821": "沪深300红利",
+    "H30533": "中国互联网50",
 }
 
 DEFAULT_INDEX_CODE = "000922"
-DEFAULT_INDEX_NAME = "中证红利50"
+DEFAULT_INDEX_NAME = "中证红利"
 
 
 class CSIDividend50Scraper(BaseScraper):
-    """中证系列指数双源爬虫（默认中证红利50，可切换到任意中证指数）
+    """中证红利类指数双源爬虫（默认中证红利，可切换到任意中证指数）
 
     支持两个数据源:
         - "akshare": 通过AKShare库获取（推荐，数据全、稳定）
@@ -49,7 +49,7 @@ class CSIDividend50Scraper(BaseScraper):
         """
         Args:
             source:     数据源，"akshare" 或 "csi"
-            index_code: 指数代码，默认 "000922"(中证红50)
+            index_code: 指数代码，默认 "000922"(中证红利)
                         其他常用: "H30269"(红利低波), "930955"(红利低波100)
             index_name: 指数名称（不传则从KNOWN_INDICES查）
         """
@@ -94,10 +94,12 @@ class CSIDividend50Scraper(BaseScraper):
                 if len(date_str) == 8:
                     date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
+                official_name = item.get("indexNameCn") or item.get("indexNameCnAll") or self.index_name
+
                 records.append(IndexRecord(
                     date=date_str,
                     index_code=self.index_code,
-                    index_name=self.index_name,
+                    index_name=official_name,
                     open=float(item.get("open") or item.get("idxOpen") or 0),
                     high=float(item.get("high") or item.get("idxHigh") or 0),
                     low=float(item.get("low") or item.get("idxLow") or 0),
@@ -167,133 +169,117 @@ class CSIDividend50Scraper(BaseScraper):
     # ══════════════════════════════════════════════════════════
 
     def fetch_valuation(self, indicator: str = "all") -> List[IndexValuationRecord]:
-        """获取估值数据（PE/PB/股息率）
+        """获取估值数据（优先使用中证官方长周期数据）
 
         Args:
             indicator: "pe" / "pb" / "dividend_yield" / "all"
-                       当 source="akshare" 时支持全部
-                       当 source="csi" 时仅支持有限字段
+                       当前稳定支持 PE 和股息率；PB 取决于官方是否提供
 
         Returns:
             IndexValuationRecord 列表
         """
-        if self.source == "akshare":
-            return self._fetch_valuation_akshare(indicator)
-        else:
-            return self._fetch_valuation_csi()
+        return self._fetch_valuation_official(indicator)
 
-    def _fetch_valuation_akshare(self, indicator: str = "all") -> List[IndexValuationRecord]:
-        """通过AKShare获取估值数据
+    def _fetch_valuation_official(self, indicator: str = "all") -> List[IndexValuationRecord]:
+        """通过中证官方接口和静态文件获取估值数据
 
-        使用 index_value_hist_funddb 接口获取 韭圈儿 的估值数据
+        说明:
+            - 长周期 PE: 复用中证官方 index-perf 接口中的滚动市盈率字段
+            - 近期股息率: 读取中证官方估值 xls 文件
+            - PB: 官方当前未稳定提供，可能为空
         """
-        try:
-            import akshare as ak
-        except ImportError:
-            raise ImportError("请安装 akshare: pip install akshare")
-
         records_map: Dict[str, IndexValuationRecord] = {}
 
-        indicator_map = {
-            "pe": "市盈率",
-            "pb": "市净率",
-            "dividend_yield": "股息率",
-        }
+        if indicator not in ("all", "pe", "pb", "dividend_yield"):
+            raise ValueError(f"不支持的估值指标: {indicator}")
 
-        targets = list(indicator_map.items()) if indicator == "all" else \
-            [(indicator, indicator_map[indicator])]
-
-        for field_name, cn_name in targets:
+        perf_req = self.build_request(start_date="20100101", end_date=datetime.now().strftime("%Y%m%d"))
+        response = self.fetch(**perf_req)
+        if response is not None and indicator in ("all", "pe"):
             try:
-                logger.info(f"[AKShare] 获取 {self.index_name} {cn_name} ...")
-                # 韭圈儿上的名称可能不同，尝试几种
-                df = None
-                for name_try in ["中证红利", "中证红利50"]:
-                    try:
-                        df = ak.index_value_hist_funddb(
-                            symbol=name_try,
-                            indicator=cn_name,
-                        )
-                        if df is not None and not df.empty:
-                            break
-                    except Exception:
-                        continue
-
-                if df is None or df.empty:
-                    logger.warning(f"[AKShare] {cn_name} 数据为空，跳过")
-                    continue
-
-                for _, row in df.iterrows():
-                    date_val = row.get("日期") or row.get("date")
-                    date_str = str(date_val)[:10]
-                    value = float(row.get(cn_name) or row.get("value") or 0)
+                data = response.json()
+                items = data if isinstance(data, list) else data.get("data", [])
+                for item in items:
+                    date_str = item.get("tradeDate") or item.get("tradingDay", "")
+                    if len(date_str) == 8:
+                        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
                     if date_str not in records_map:
                         records_map[date_str] = IndexValuationRecord(
                             date=date_str,
                             index_code=self.index_code,
-                            source="akshare_funddb",
+                            source="csi_official",
                         )
 
-                    rec = records_map[date_str]
-                    if field_name == "pe":
-                        rec.pe = value
-                    elif field_name == "pb":
-                        rec.pb = value
-                    elif field_name == "dividend_yield":
-                        rec.dividend_yield = value
-
-                logger.info(f"[AKShare] {cn_name}: {len(df)} 条")
-
+                    pe_value = item.get("peg")
+                    if pe_value not in (None, ""):
+                        try:
+                            records_map[date_str].pe = float(pe_value)
+                        except (TypeError, ValueError):
+                            pass
             except Exception as e:
-                logger.warning(f"[AKShare] 获取{cn_name}失败: {e}")
-                continue
+                logger.warning(f"[CSI官网] 长周期PE获取失败: {e}")
+
+        if indicator in ("all", "dividend_yield", "pe"):
+            try:
+                import pandas as pd
+
+                valuation_url = (
+                    "https://oss-ch.csindex.com.cn/static/"
+                    f"html/csindex/public/uploads/file/autofile/indicator/{self.index_code}indicator.xls"
+                )
+                df = pd.read_excel(valuation_url)
+                if df is not None and not df.empty:
+                    df.columns = [
+                        "日期",
+                        "指数代码",
+                        "指数中文全称",
+                        "指数中文简称",
+                        "指数英文全称",
+                        "指数英文简称",
+                        "市盈率1",
+                        "市盈率2",
+                        "股息率1",
+                        "股息率2",
+                    ]
+                    df["日期"] = pd.to_datetime(df["日期"], format="%Y%m%d", errors="coerce")
+
+                    for _, row in df.iterrows():
+                        if pd.isna(row["日期"]):
+                            continue
+
+                        date_str = row["日期"].strftime("%Y-%m-%d")
+                        if date_str not in records_map:
+                            records_map[date_str] = IndexValuationRecord(
+                                date=date_str,
+                                index_code=self.index_code,
+                                source="csi_official",
+                            )
+
+                        rec = records_map[date_str]
+                        if indicator in ("all", "pe") and rec.pe is None:
+                            for pe_col in ("市盈率2", "市盈率1"):
+                                pe_value = row.get(pe_col)
+                                if pd.notna(pe_value):
+                                    rec.pe = float(pe_value)
+                                    break
+
+                        if indicator in ("all", "dividend_yield"):
+                            for dy_col in ("股息率2", "股息率1"):
+                                dy_value = row.get(dy_col)
+                                if pd.notna(dy_value):
+                                    rec.dividend_yield = float(dy_value)
+                                    break
+            except Exception as e:
+                logger.warning(f"[CSI官网] 估值静态文件获取失败: {e}")
 
         records = sorted(records_map.values(), key=lambda r: r.date)
-        logger.info(f"[AKShare] 估值数据共 {len(records)} 条")
+        logger.info(f"[CSI官网] 估值数据共 {len(records)} 条")
         return records
 
     def _fetch_valuation_csi(self) -> List[IndexValuationRecord]:
-        """从CSI官网获取估值数据
-
-        中证官网有指数估值（PE/PB等）的API，但接口可能有变动
-        """
-        url = (
-            f"https://www.csindex.com.cn/csindex-home/perf/index-perf-value"
-            f"?indexCode={self.index_code}"
-        )
-        response = self.fetch(url, headers={"Accept": "application/json"})
-        if response is None:
-            return []
-
-        try:
-            data = response.json()
-        except Exception as e:
-            logger.error(f"CSI估值响应解析失败: {e}")
-            return []
-
-        records = []
-        items = data if isinstance(data, list) else data.get("data", [])
-
-        for item in items:
-            try:
-                date_str = item.get("tradeDate", "")
-                if len(date_str) == 8:
-                    date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-
-                records.append(IndexValuationRecord(
-                    date=date_str,
-                    index_code=self.index_code,
-                    pe=float(item.get("pe") or 0) or None,
-                    pb=float(item.get("pb") or 0) or None,
-                    dividend_yield=float(item.get("dividendYield") or 0) or None,
-                    source="csi_official",
-                ))
-            except (ValueError, TypeError):
-                continue
-
-        logger.info(f"[CSI官网] 估值数据 {len(records)} 条")
-        return records
+        """兼容旧调用，统一转到官方稳定估值源。"""
+        return self._fetch_valuation_official(indicator="all")
 
     # ══════════════════════════════════════════════════════════
     #  统一入口

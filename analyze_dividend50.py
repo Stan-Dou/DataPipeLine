@@ -1,4 +1,4 @@
-"""中证红利类指数 历史数据分析 - 寻找低估区间
+"""中证红利类指数历史数据分析 - 寻找低估区间
 
 分析维度：
   1. 价格走势 + 关键均线
@@ -7,7 +7,7 @@
   4. 低点特征总结
 
 用法：
-    python analyze_dividend50.py                              # 默认中证红利50
+    python analyze_dividend50.py                              # 默认中证红利
     python analyze_dividend50.py --code H30269                # 中证红利低波（515450追踪）
     python analyze_dividend50.py --code 930955                # 中证红利低波100
     python analyze_dividend50.py --skip-fetch                 # 跳过爬取直接分析
@@ -34,7 +34,7 @@ DEFAULT_INDEX_CODE = "000922"
 
 def fetch_and_store(source: str = "akshare",
                     index_code: str = DEFAULT_INDEX_CODE,
-                    start_date: str = "20130101") -> Tuple[int, int]:
+                    start_date: str = "20100101") -> Tuple[int, int]:
     """爬取数据并存入数据库，返回 (行情条数, 估值条数)"""
     dao = IndexDAO(DB_PATH)
     scraper = CSIDividend50Scraper(source=source, index_code=index_code)
@@ -256,10 +256,13 @@ def analyze(index_code: str = DEFAULT_INDEX_CODE):
         pe_list = [v["pe"] for v in valuation if v.get("pe")]
         pb_list = [v["pb"] for v in valuation if v.get("pb")]
         dy_list = [v["dividend_yield"] for v in valuation if v.get("dividend_yield")]
+        pe_dates = [v["date"] for v in valuation if v.get("pe")]
+        dy_dates = [v["date"] for v in valuation if v.get("dividend_yield")]
 
         if pe_list:
             current_pe = pe_list[-1]
             print(f"\n  [PE 市盈率]")
+            print(f"    样本区间: {pe_dates[0]} → {pe_dates[-1]}  共 {len(pe_list)} 条")
             print(f"    当前:   {current_pe:.2f}")
             print(f"    最高:   {max(pe_list):.2f}")
             print(f"    最低:   {min(pe_list):.2f}")
@@ -278,17 +281,25 @@ def analyze(index_code: str = DEFAULT_INDEX_CODE):
             print(f"    均值:   {statistics.mean(pb_list):.2f}")
             print(f"    分位数: {calc_percentile(pb_list, current_pb):.1f}%")
 
+        else:
+            print(f"\n  [PB 市净率]")
+            print(f"    官方当前未提供稳定的长周期 PB 数据")
+
         if dy_list:
             current_dy = dy_list[-1]
             print(f"\n  [股息率]")
+            print(f"    样本区间: {dy_dates[0]} → {dy_dates[-1]}  共 {len(dy_list)} 条")
             print(f"    当前:   {current_dy:.2f}%")
             print(f"    最高:   {max(dy_list):.2f}%")
             print(f"    最低:   {min(dy_list):.2f}%")
             print(f"    均值:   {statistics.mean(dy_list):.2f}%")
-            print(f"    分位数: {calc_percentile(dy_list, current_dy):.1f}%")
-            # 股息率越高 = 价格越低 = 越有吸引力
-            if current_dy >= sorted(dy_list)[int(len(dy_list) * 0.7)]:
-                print(f"    ✅ 股息率处于历史较高水平（>70%分位），具备配置价值")
+            if len(dy_list) >= 120:
+                print(f"    分位数: {calc_percentile(dy_list, current_dy):.1f}%")
+                # 股息率越高 = 价格越低 = 越有吸引力
+                if current_dy >= sorted(dy_list)[int(len(dy_list) * 0.7)]:
+                    print(f"    ✅ 股息率处于历史较高水平（>70%分位），具备配置价值")
+            else:
+                print(f"    提示: 股息率历史样本较短，仅作近期参考，不参与长期低估判断")
     else:
         print(f"\n【6. 估值分析】")
         print(f"  无估值数据，跳过")
@@ -336,7 +347,7 @@ def analyze(index_code: str = DEFAULT_INDEX_CODE):
                 signals.append(f"  🟢 PE {pe_vals[-1]:.1f} 处于 {pe_pct:.0f}% 分位（低估）")
             elif pe_pct > 70:
                 signals.append(f"  🔴 PE {pe_vals[-1]:.1f} 处于 {pe_pct:.0f}% 分位（偏贵）")
-        if dy_vals:
+        if len(dy_vals) >= 120:
             dy_pct = calc_percentile(dy_vals, dy_vals[-1])
             if dy_pct > 70:
                 signals.append(f"  🟢 股息率 {dy_vals[-1]:.2f}% 处于 {dy_pct:.0f}% 分位（高股息，有吸引力）")
