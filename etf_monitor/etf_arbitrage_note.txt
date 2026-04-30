@@ -1,0 +1,307 @@
+# ETF Arbitrage Trap Notes (HK-listed A-share ETFs)
+
+> Audience: an LLM (GPT-5.4 class) that will reason about whether/how to trade
+> the discount-mean-reversion strategy implemented around `etf_live_monitor.py`.
+> Format: dense, declarative, English+Chinese mixed where Chinese is the
+> precise local term. Each item is "FACT: <fact> -> IMPLICATION: <what to do>".
+> Last updated 2026-04 by human + Copilot pair.
+
+---
+
+## 0. One-line strategy thesis
+
+When ETF market price (`P`) deviates from the official intraday estimated
+NAV (`iNAV`, HKD-converted), buy the cheap side and wait for convergence.
+
+Discount in basis points:
+    bps = (P - iNAV) / iNAV * 1e4
+- bps <  0  -> discount, P below fair value -> potential BUY
+- bps >  0  -> premium,  P above fair value -> potential SELL/avoid
+
+Mean reversion is not free money. The traps below are what kill the trade.
+
+---
+
+## 1. Universe definition: HK-listed A-share ETFs
+
+Listed in HKD, holdings are A-shares (CNY). `iNAV` is published in both RMB
+and HKD by the index calculator (ICE). Reference table:
+
+| Symbol | Name (en)                  | Reference index   | Issuer  |
+|--------|----------------------------|-------------------|---------|
+| 2822   | CSOP FTSE China A50 ETF    | FTSE China A50    | CSOP    |
+| 2823   | iShares FTSE China A50 ETF | FTSE China A50    | iShares |
+| 3033   | CSOP CSI 300 ETF           | CSI 300           | CSOP    |
+| 3037   | CSOP MSCI China A 50 Conn. | MSCI A50 Conn.    | CSOP    |
+| 3067   | iShares Hang Seng TECH     | Hang Seng TECH    | iShares |  (*not A-share, skip*)
+| 3115   | iShares CSI A-Share Cons.  | CSI 100/300 mix   | iShares |
+| 3188   | ChinaAMC CSI 300 ETF       | CSI 300           | ChinaAMC|
+
+Pure HK ETFs (e.g. 2800 Tracker Fund of HK, 2828 Hang Seng China Ent.) do
+NOT have the A-share session-mismatch trap. They are still in the probe
+universe but are control samples.
+
+---
+
+## 2. The structural session-mismatch trap (CRITICAL)
+
+### 2.1 Trading hours (all in Asia/Shanghai = Asia/Hong_Kong = UTC+8)
+
+```
+A-share (SSE/SZSE):  09:30-11:30 , 13:00-15:00          (4h)
+HK equities (SEHK):  09:30-12:00 , 13:00-16:00          (5.5h)
+```
+
+### 2.2 What happens in each window
+
+| HK time         | A-share state   | iNAV behavior                              | Implication                                                |
+|-----------------|-----------------|--------------------------------------------|------------------------------------------------------------|
+| 09:30-11:30     | open            | live, ticking ~5s                          | normal mean-reversion regime; basis is tradable            |
+| 11:30-13:00     | LUNCH (closed)  | FROZEN at 11:30:00 print                   | iNAV is stale. ETF price keeps moving on HK flow + leaks   |
+| 13:00-15:00     | open            | live again                                 | normal regime                                              |
+| 15:00-16:00     | CLOSED          | FROZEN at 15:00:00 print (or close NAV)    | ETF still trades in HK with no underlying price discovery  |
+
+### 2.3 Why this is a trap, not an opportunity
+
+When A-share is closed, the HK ETF price BECOMES the price-discovery
+instrument. Smart money trades the ETF based on news, futures (FTSE A50
+futures on SGX run longer), and mainland sentiment, while iNAV stays at the
+last A-share print.
+
+Naive interpretation:
+  "ETF price rose 50bps above iNAV in the lunch break -> premium -> short!"
+Reality:
+  "ETF price rose because A50 SGX futures rose 60bps; iNAV will gap up at
+  13:00 reopen. The 'premium' was an information leading indicator, not
+  mispricing."
+
+Empirically the ETF leads iNAV during A-share closure with R^2 typically
+> 0.7 against SGX A50 futures movement. Trading on the stale iNAV is
+selecting against yourself.
+
+### 2.4 Defensive rule
+
+NEVER signal on `bps` when A-share is closed unless you have explicitly
+modeled the futures-implied iNAV. The monitor should expose:
+- `a_share_open` (bool)
+- `nav_staleness_seconds` (int) = now_utc - parse(inav_time)
+
+Filter: trade only when `a_share_open == True AND nav_staleness_seconds < 30`.
+
+---
+
+## 3. iNAV pipeline traps
+
+### 3.1 Update cadence
+
+- ICE publishes iNAV roughly every 5s during A-share hours.
+- Our poller defaults to 15s; this UNDERSAMPLES. Lower to 5s if alpha
+  decays faster than poll interval.
+- If poll fails (network, ICE 5xx), the previous row is gone but the
+  monitor writes an error row. Backtests must filter `official_inav_error == ""`.
+
+### 3.2 RMB -> HKD conversion
+
+iNAV_HKD = iNAV_RMB * (RMB/HKD spot)
+- The FX rate ICE uses is sampled at iNAV publish time. It is NOT a
+  real-time CNH/HKD or USDHKD-derived rate. Mismatch can be 5-15 bps in
+  stress.
+- Implication: a "discount" of < 15 bps may be entirely FX noise. Set the
+  trade trigger threshold > 30 bps to clear FX uncertainty.
+
+### 3.3 iNAV vs end-of-day NAV
+
+- iNAV = intraday estimate from index basket * static creation basket.
+- End-of-day NAV = actual fund accounting NAV with fees, cash drag,
+  dividend accrual.
+- Daily drift between iNAV and EoD NAV of 5-20 bps is normal. Do NOT
+  conclude "all discounts mean-revert to zero". They mean-revert to the
+  iNAV-vs-NAV bias of the specific ETF, which is usually slightly negative
+  (fund slightly underperforms index due to fees).
+
+### 3.4 IB's own `ib_nav_last` (tick types 96-99)
+
+- IB's NAV tick is a separate calculation, sometimes proprietary, often
+  staler than ICE iNAV by 30-60s.
+- Use ICE iNAV as the ground truth; treat IB NAV as redundant cross-check.
+- `latest_nav_ticks()` reads from `ticker.ticks` (a deque ib_insync may
+  truncate). Don't rely on it for historical reconstruction; rely on the
+  CSV log.
+
+---
+
+## 4. Execution and microstructure traps
+
+### 4.1 Half-spread cost
+
+For HK ETFs, typical bid-ask spreads (in bps of mid):
+- 2800, 2828, 2822, 3188:  3-8 bps   (liquid)
+- 3037, 3033:              8-20 bps  (medium)
+- 3115, smaller issuers:   20-50 bps (thin)
+
+Round-trip cost = 2 * half-spread + 2 * commission + stamp duty (HK = 0
+for ETF) + SFC levy (~0.3 bps) + clearing fee (~0.4 bps).
+
+Total round-trip floor: ~10 bps for liquid names, ~50 bps for thin names.
+
+DO NOT trade discounts smaller than 2x round-trip cost. The signal must
+clear cost AND have positive edge after that.
+
+### 4.2 Asymmetric execution side
+
+`bps_ask` = (ask - iNAV)/iNAV*1e4 -> if very negative, you can BUY at ask
+                                     and capture the discount on entry.
+`bps_bid` = (bid - iNAV)/iNAV*1e4 -> if very positive, you can SELL at bid
+                                     and capture the premium on entry.
+`bps_mid` is for analysis only; you cannot trade at mid unless you post.
+
+The monitor logs `ask_ib_nav_discount_bps`, `bid_ib_nav_discount_bps`,
+`last_ib_nav_discount_bps`. The triggering field for a long entry is
+`ask_ib_nav_discount_bps`, NOT mid.
+
+### 4.3 Posting passive vs hitting active
+
+Posting a buy at bid and waiting captures spread but you sit in the queue.
+On HK ETFs the queue is shallow; if iNAV moves against you, your order
+gets adversely selected.
+Hitting the ask costs the spread but is fast.
+Plan: model both. Default to hitting for retail-scale capital.
+
+### 4.4 Short-side feasibility
+
+- HK ETFs are shortable IF on the SEHK Designated Securities for Short
+  Selling list AND IB has borrow. Many A-share ETFs have very thin borrow.
+- Borrow rate can be 5-30% annualized in stress -> destroys the carry of a
+  multi-day mean-reversion trade.
+- Implication: the long-discount side is more reliably tradable than
+  short-premium. Strategy should be biased long-only or use index futures
+  (FTSE A50 SGX, HSCEI HKFE) as the short hedge.
+
+### 4.5 No retail creation/redemption
+
+True ETF arbitrage uses creation/redemption with the AP (authorized
+participant) at end-of-day NAV against a basket of A-shares. Retail
+cannot do this. Therefore retail "arb" is purely directional bet on
+mean reversion of `P-iNAV`. Never call it arbitrage internally; call it
+`ETF basis trade` or `discount mean reversion`.
+
+---
+
+## 5. Calendar / holiday traps
+
+- HK holidays != mainland holidays. Examples that matter:
+  - HK Easter / Good Friday: HK closed, A-share open. No problem here, we
+    just don't trade.
+  - Mainland Golden Week / Spring Festival: A-share closed for a week, HK
+    open. iNAV is FROZEN for days. Discounts can blow out 100-300 bps and
+    NOT mean-revert until A-share reopens. DO NOT trade these windows.
+- Half-day HK trading (Christmas Eve, NYE, CNY eve): A-share session-
+  mismatch logic must include HK early close.
+- Northbound stock-connect closures (e.g. T+1 settlement days, public
+  holidays in either market): in-kind creation/redemption for A-share ETFs
+  may pause -> APs cannot arb -> structural discount widens. This is a
+  REGIME, not noise. Detect via `dataframe groupby(date).std(bps)` spikes.
+
+---
+
+## 6. Latency reality for retail
+
+- IB Gateway top-of-book tick latency: typically 50-250ms from exchange.
+- ICE iNAV latency: 1-5s aggregation + ~100-300ms HTTP.
+- Our writer adds <10ms; our 3-thread design adds <50ms scheduling jitter.
+
+So the freshest snapshot the monitor can stamp has internal asynchrony of
+~250ms-5s between the IB price half and the iNAV half. The `state_age_ms`
+column makes this explicit.
+
+For a retail trader who clicks/sends an order, total reaction is 500ms-2s
+on top. HFT competitors are <1ms colo. Therefore:
+- Do NOT chase signals that decay in <5s.
+- Target signals with half-life >= 30s. Discount mean-reversion at this
+  scale is plausible; tick-by-tick basis trading is not.
+
+---
+
+## 7. Mean-reversion failure modes (when to NOT trade)
+
+1. Regime break: ETF AP backed off (creation/redemption suspended). The
+   discount becomes structural and may widen further. Detect via:
+   `rolling 5-day median(bps) drifting > 20 bps`.
+2. Underlying halt: an A50 constituent (e.g. CATL, Kweichow Moutai) is
+   halted. iNAV uses last price and is wrong by however much that name has
+   moved on news. Correct iNAV via futures-implied basket is non-trivial.
+3. Index event: addition/deletion days, the basket is being rebalanced;
+   AP behavior is anomalous around close.
+4. Ex-dividend day on A-share constituents: iNAV drops by dividend amount
+   instantaneously; ETF price may not reflect immediately if HK is on
+   different cash-tracking convention.
+5. CNH/CNY divergence: in stress (e.g. RMB devaluation episodes), CNH/CNY
+   gap widens; FX-translated iNAV becomes ambiguous.
+
+For each, the protective rule: if rolling 1-hour z-score of `bps` is > 3,
+do NOT enter a new position; manage existing position only.
+
+---
+
+## 8. What `etf_live_monitor.py` records and what each file is for
+
+| File suffix              | Purpose                                              |
+|--------------------------|------------------------------------------------------|
+| `_ib_ticks.csv`          | Every IB L1 tick. Tick-level reconstruction.         |
+| `_ib_depth.csv`          | L2 DOM updates (when --with-depth). Liquidity model. |
+| `_official_inav.csv`     | One row per ICE poll. Ground truth iNAV series.      |
+| `_sync_snapshot.csv`     | Joined view: iNAV row + latest IB state at poll time |
+| `ib_nav_probe.csv`       | One-shot probe at startup; diagnostic only.          |
+
+Backtest entry point: `_sync_snapshot.csv`. Filter:
+- `official_inav_error == ""`
+- `state_age_ms < 30000` (data fresh enough)
+- `a_share_open == True`  (when this column lands; see section 2.4)
+- `nav_staleness_seconds < 30`
+
+Then compute features and labels off `bps`, `bps_ask`, `bps_bid`.
+
+---
+
+## 9. Concrete next analytical steps for whoever reads this
+
+1. Validate session-mismatch hypothesis empirically: regress `delta_bps`
+   from 11:30 to 13:00 against SGX A50 futures `delta_pct` over same
+   window. Expect `R^2 > 0.6`.
+2. Build the regime detector: rolling 5-day median bps; flag breaks > 20bps.
+3. Estimate cost realistically per symbol from `_ib_depth.csv` (effective
+   spread at trade size).
+4. Backtest: enter when `bps_ask < -2*round_trip_cost` AND filters in
+   section 8 pass; exit when `bps_mid >= 0` OR holding period > 1 day OR
+   stop at `bps_mid < -3*round_trip_cost`.
+5. Estimate strategy capacity: total daily volume of e.g. 2822 in HKD,
+   participation rate 1-2% -> max position size.
+
+---
+
+## 10. Things this note explicitly does NOT claim
+
+- That mean reversion of HK A-share ETF basis is statistically significant
+  net of costs at retail scale. (Open question. Prove it before sizing.)
+- That ICE iNAV is unbiased. (Section 3.3 says it isn't.)
+- That `etf_live_monitor.py` is sufficient for production trading. It is
+  a research data recorder. Trade execution would need additional
+  components: order manager, position book, risk limits, kill switch.
+
+---
+
+## 11. Glossary (for downstream LLM)
+
+- iNAV: intraday estimated net asset value, published periodically.
+- AP: authorized participant. Broker-dealer entitled to create/redeem
+  shares with the issuer at NAV against the underlying basket.
+- Creation basket: list of A-share holdings + cash that = 1 creation unit.
+- bps: basis points. 1 bps = 0.01% = 0.0001.
+- L1 / top-of-book: best bid + best ask + last trade.
+- L2 / DOM (depth of market): N levels per side.
+- Stock Connect: cross-border trading link Northbound (HK->Mainland) and
+  Southbound (Mainland->HK).
+- Frozen NAV / stale NAV: iNAV not updating because underlying market
+  closed or feed broken.
+- Basis: P_etf - iNAV (in price units) or in bps.
+- Half-life: time for a signal to decay to half its initial magnitude.

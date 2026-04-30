@@ -1,19 +1,34 @@
+"""Unified live monitor for HK ETFs.
+
+Streams IB Gateway top-of-book ticks, IB ETF NAV ticks, optional Level-2
+market depth and the official ICE iNAV for a given HK ETF symbol into a
+small set of CSV files. Designed to run unattended for hours/days with
+automatic reconnect on transient IB Gateway failures.
+"""
+
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import logging
 import math
 import queue
 import threading
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from ib_insync import IB, Stock, Ticker
+
+# ---------------------------------------------------------------------------
+# Module-wide logger. Configured by setup_logging() in main().
+# ---------------------------------------------------------------------------
+log = logging.getLogger("etf_monitor")
 
 
 DEFAULT_PROBE_SYMBOLS = [
@@ -43,7 +58,22 @@ IB_TOP_TICK_FIELDS = {
     99: "ib_nav_low",
 }
 
+# Generic tick list requested for ETF subscriptions:
+#   577 = ETF Average Volume, 614 = ETF NAV Last, 623 = ETF NAV Close.
+# These map to the 96/97/98/99 tick types in IB_TOP_TICK_FIELDS.
+DEFAULT_GENERIC_TICKS = "577,614,623"
+
+# IB error codes that indicate the market-depth subscription is gone or never
+# became available. When a depth error matches one of these and the contract
+# matches the primary subscription, depth is marked inactive.
+DEPTH_RELATED_ERROR_CODES = frozenset({309, 354, 2152, 10089, 10090, 10091, 10092})
+
 OFFICIAL_INAV_API_URL = "https://inav.ice.com/api/1/csop/application/index/quote"
+
+# A-share market timezone. The official iNAV is referenced to A-share trading
+# hours (Shanghai/Shenzhen). Both Beijing and Hong Kong are UTC+8 so the
+# offset is sufficient for our coarse open/closed flag.
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 MARKET_FIELDS = [
     "event_time",
@@ -118,6 +148,8 @@ SYNC_SNAPSHOT_FIELDS = [
     "official_discount_hkd_pct",
     "official_inav_time",
     "official_market_price_time",
+    "nav_staleness_seconds",
+    "a_share_open",
     "l1_last_update_at",
     "l2_last_update_at",
     "l1_age_ms",
@@ -355,6 +387,41 @@ def parse_args() -> argparse.Namespace:
         default=Path("data"),
         help="Directory for CSV outputs, default: ./data",
     )
+    parser.add_argument(
+        "--official-inav-timeout",
+        type=float,
+        default=5.0,
+        help="HTTP timeout in seconds for the official iNAV request, default: 5",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity, default: INFO",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Path to log file. Defaults to <output-dir>/etf_monitor.log",
+    )
+    parser.add_argument(
+        "--no-reconnect",
+        action="store_true",
+        help="Exit immediately if the IB session fails instead of reconnecting",
+    )
+    parser.add_argument(
+        "--reconnect-base",
+        type=float,
+        default=1.0,
+        help="Base seconds for the reconnect exponential backoff, default: 1",
+    )
+    parser.add_argument(
+        "--reconnect-cap",
+        type=float,
+        default=60.0,
+        help="Maximum seconds between reconnect attempts, default: 60",
+    )
     return parser.parse_args()
 
 
@@ -371,9 +438,21 @@ def safe_number(value: Any) -> float | None:
 
 
 def discount_bps(price: float | None, nav_value: float | None) -> float | None:
-    if price is None or nav_value is None or nav_value == 0:
+    """Return premium/discount in basis points or None when inputs are unusable.
+
+    NAV must be strictly positive; otherwise the result is meaningless and
+    None is returned.
+    """
+    if price is None or nav_value is None or nav_value <= 0:
         return None
     return (price - nav_value) / nav_value * 10000
+
+
+def compute_backoff(attempt: int, base: float = 1.0, cap: float = 60.0) -> float:
+    """Exponential backoff with cap. attempt=0 returns base; doubles each step."""
+    if attempt < 0:
+        attempt = 0
+    return min(cap, base * (2 ** attempt))
 
 
 def ensure_header(path: Path, fieldnames: list[str]) -> None:
@@ -393,25 +472,51 @@ def ensure_header(path: Path, fieldnames: list[str]) -> None:
         writer.writeheader()
 
 
+def now_utc() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime."""
+    return datetime.now(tz=timezone.utc)
+
+
+def iso_now() -> str:
+    """Return the current UTC time formatted as an ISO-8601 millisecond string."""
+    return now_utc().isoformat(timespec="milliseconds")
+
+
 def isoformat_timestamp(value: Any) -> str:
+    """Format a timestamp (datetime or None) as an ISO-8601 string in UTC.
+
+    Naive datetimes coming from the IB API are interpreted as UTC; aware
+    datetimes are converted. When ``value`` is missing the current time is
+    returned.
+    """
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
         return value.isoformat(timespec="milliseconds")
-    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+    return iso_now()
 
 
 def parse_iso_datetime(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 string. Naive inputs are interpreted as UTC."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def age_ms(reference_time: datetime, update_time_text: str | None) -> int | None:
     update_time = parse_iso_datetime(update_time_text)
-    if not update_time:
+    if update_time is None:
         return None
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
     return max(0, int((reference_time - update_time).total_seconds() * 1000))
 
 
@@ -454,7 +559,7 @@ def update_market_state(state: dict[str, Any], ticker: Ticker, tick: Any) -> dic
 
     return {
         "event_time": isoformat_timestamp(getattr(tick, "time", None)),
-        "received_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "received_at": iso_now(),
         "symbol": state["symbol"],
         "tick_type": tick.tickType,
         "tick_name": field_name,
@@ -519,7 +624,7 @@ def build_depth_row(symbol: str, ticker: Ticker, tick: Any) -> dict[str, Any]:
     return {
         "event_kind": "data",
         "event_time": isoformat_timestamp(getattr(tick, "time", None)),
-        "received_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "received_at": iso_now(),
         "symbol": symbol,
         "status": "ok",
         "message": "",
@@ -540,8 +645,8 @@ def build_depth_row(symbol: str, ticker: Ticker, tick: Any) -> dict[str, Any]:
 def depth_status_row(symbol: str, status: str, message: str, error_code: str = "") -> dict[str, Any]:
     return {
         "event_kind": "status",
-        "event_time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-        "received_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "event_time": iso_now(),
+        "received_at": iso_now(),
         "symbol": symbol,
         "status": status,
         "message": message,
@@ -568,7 +673,7 @@ def build_sync_snapshot_row(
     l2_last_update_at: str | None,
 ) -> dict[str, Any]:
     captured_at = official_row["captured_at"]
-    captured_dt = parse_iso_datetime(captured_at) or datetime.now().astimezone()
+    captured_dt = parse_iso_datetime(captured_at) or now_utc()
     bid = market_state["bid"]
     ask = market_state["ask"]
     last = market_state["last"]
@@ -625,7 +730,7 @@ def build_official_inav_url(symbol: str, language: str) -> str:
     return f"{OFFICIAL_INAV_API_URL}?{query}"
 
 
-def fetch_official_inav(symbol: str, language: str) -> dict[str, Any]:
+def fetch_official_inav(symbol: str, language: str, timeout: float = 5.0) -> dict[str, Any]:
     request = Request(
         build_official_inav_url(symbol, language),
         headers={
@@ -633,7 +738,7 @@ def fetch_official_inav(symbol: str, language: str) -> dict[str, Any]:
             "Accept": "application/json,text/plain,*/*",
         },
     )
-    with urlopen(request, timeout=20) as response:
+    with urlopen(request, timeout=timeout) as response:
         payload = response.read().decode("utf-8")
     return json.loads(payload)
 
@@ -662,7 +767,7 @@ def flatten_official_inav(symbol: str, payload: dict[str, Any]) -> dict[str, str
     ratios = quote.get("ratios", [])
 
     return {
-        "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "captured_at": now_utc().isoformat(timespec="seconds"),
         "symbol": symbol,
         "error": "",
         "time_zone": quote.get("timeZone", ""),
@@ -686,27 +791,22 @@ def flatten_official_inav(symbol: str, payload: dict[str, Any]) -> dict[str, str
 
 def official_inav_error_row(symbol: str, error: str) -> dict[str, str]:
     row = {field: "" for field in OFFICIAL_INAV_FIELDS}
-    row["captured_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    row["captured_at"] = now_utc().isoformat(timespec="seconds")
     row["symbol"] = symbol
     row["error"] = error
     return row
 
 
-def print_official_snapshot(row: dict[str, str]) -> None:
+def log_official_snapshot(row: dict[str, str]) -> None:
     if row["error"]:
-        print(f"{row['captured_at']} | symbol={row['symbol']} | official_inav_error={row['error']}")
+        log.warning("Official iNAV error: symbol=%s err=%s", row["symbol"], row["error"])
         return
-
-    print(
-        " | ".join(
-            [
-                row["captured_at"],
-                f"symbol={row['symbol']}",
-                f"inav_hkd={row['inav_hkd']}",
-                f"market_price_hkd={row['market_price_hkd']}",
-                f"discount_hkd={row['premium_discount_hkd_pct']}",
-            ]
-        )
+    log.info(
+        "Official iNAV: symbol=%s inav_hkd=%s market_price_hkd=%s discount_hkd=%s",
+        row["symbol"],
+        row["inav_hkd"],
+        row["market_price_hkd"],
+        row["premium_discount_hkd_pct"],
     )
 
 
@@ -722,7 +822,7 @@ def qualify_primary_contract(ib: IB, args: argparse.Namespace):
 def probe_ib_nav_capabilities(ib: IB, args: argparse.Namespace, writer: CsvWriteWorker) -> None:
     for symbol in args.probe_symbols:
         row = {
-            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "captured_at": now_utc().isoformat(timespec="seconds"),
             "symbol": symbol,
             "qualified": False,
             "bid": None,
@@ -743,12 +843,12 @@ def probe_ib_nav_capabilities(ib: IB, args: argparse.Namespace, writer: CsvWrite
             if not qualified:
                 row["error"] = "qualify_failed"
                 writer.submit("probe", row)
-                print(f"{symbol}: qualify_failed")
+                log.warning("Probe %s: qualify_failed", symbol)
                 continue
 
             row["qualified"] = True
             contract = qualified[0]
-            ticker = ib.reqMktData(contract, genericTickList="577,614,623", snapshot=False)
+            ticker = ib.reqMktData(contract, genericTickList=DEFAULT_GENERIC_TICKS, snapshot=False)
 
             deadline = time.monotonic() + args.probe_wait_seconds
             while time.monotonic() < deadline:
@@ -769,15 +869,452 @@ def probe_ib_nav_capabilities(ib: IB, args: argparse.Namespace, writer: CsvWrite
                 ib.cancelMktData(ticker.contract)
 
         writer.submit("probe", row)
-        print(
-            f"{symbol}: qualified={row['qualified']} nav_last={row['ib_nav_last']} "
-            f"nav_high={row['ib_nav_high']} nav_low={row['ib_nav_low']} received_nav={row['received_nav']} error={row['error']}"
+        log.info(
+            "Probe %s: qualified=%s nav_last=%s nav_high=%s nav_low=%s received_nav=%s error=%s",
+            symbol,
+            row["qualified"],
+            row["ib_nav_last"],
+            row["ib_nav_high"],
+            row["ib_nav_low"],
+            row["received_nav"],
+            row["error"],
         )
 
+
+# ===========================================================================
+# Logging configuration
+# ===========================================================================
+def setup_logging(level_name: str, log_file: Path | None) -> None:
+    """Configure root logging with console + optional file handler."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Drop pre-existing handlers (e.g. when this is called twice).
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    # ib_insync logs every tick at INFO; keep it quieter.
+    logging.getLogger("ib_insync").setLevel(logging.WARNING)
+
+
+# ===========================================================================
+# Background poller for the official ICE iNAV
+# ===========================================================================
+
+class IceInavPoller:
+    """Polls the ICE iNAV endpoint at a fixed interval in a background thread.
+
+    Each poll (success or failure) writes one row to the ``official`` CSV via
+    the supplied writer and queues the same row for downstream consumption
+    (used by the main loop to build sync snapshots together with the latest
+    IB market state).
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        language: str,
+        interval: float,
+        writer: CsvWriteWorker,
+        request_timeout: float = 5.0,
+    ):
+        self.symbol = symbol
+        self.language = language
+        self.interval = max(1.0, interval)
+        self.writer = writer
+        self.request_timeout = request_timeout
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="ice-poller", daemon=True
+        )
+        self._pending: queue.Queue[dict[str, str]] = queue.Queue()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(2.0, self.request_timeout + 1.0))
+
+    def drain(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        while True:
+            try:
+                rows.append(self._pending.get_nowait())
+            except queue.Empty:
+                break
+        return rows
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                payload = fetch_official_inav(
+                    self.symbol, self.language, timeout=self.request_timeout
+                )
+                row = flatten_official_inav(self.symbol, payload)
+            except Exception as exc:
+                row = official_inav_error_row(
+                    self.symbol, f"{type(exc).__name__}: {exc}"
+                )
+                log.warning("Official iNAV fetch failed: %s", exc)
+            self.writer.submit("official", row)
+            self._pending.put(row)
+            elapsed = time.monotonic() - started
+            self._stop.wait(timeout=max(0.0, self.interval - elapsed))
+
+
+# ===========================================================================
+# Subscription state holders
+# ===========================================================================
+
+@dataclass
+class L1Subscription:
+    ticker: Ticker
+    market_state: dict[str, Any]
+    processed_count: int = 0
+
+
+@dataclass
+class DepthSubscription:
+    ticker: Ticker
+    contract: Any
+    is_smart: bool
+    started_at: float
+    active: bool = True
+    warned_no_data: bool = False
+    last_update_at: str | None = None
+    processed_count: int = 0
+    error_handler: Callable[..., None] | None = None
+
+
+# ===========================================================================
+# Subscription helpers
+# ===========================================================================
+
+def subscribe_depth(
+    ib: IB,
+    primary_contract: Any,
+    args: argparse.Namespace,
+    writer: CsvWriteWorker,
+) -> DepthSubscription | None:
+    """Request market depth and return a DepthSubscription, or None on failure.
+
+    The returned subscription owns an IB error-event handler that will mark
+    depth inactive (and cancel the subscription) when IB reports a known
+    depth-related error code for the same contract.
+    """
+    rows = max(1, min(args.depth_rows, 5))
+    try:
+        depth_ticker = ib.reqMktDepth(
+            primary_contract,
+            numRows=rows,
+            isSmartDepth=args.depth_smart,
+        )
+    except Exception as exc:
+        writer.submit(
+            "depth",
+            depth_status_row(
+                args.symbol,
+                "error",
+                f"Depth subscription failed: {type(exc).__name__}: {exc}",
+            ),
+        )
+        log.warning("Depth disabled: %s", exc)
+        return None
+
+    sub = DepthSubscription(
+        ticker=depth_ticker,
+        contract=primary_contract,
+        is_smart=args.depth_smart,
+        started_at=time.monotonic(),
+    )
+    writer.submit(
+        "depth",
+        depth_status_row(
+            args.symbol,
+            "subscribed",
+            f"Depth subscription started with rows={rows}, smart={args.depth_smart}",
+        ),
+    )
+
+    def on_ib_error(reqId: int, errorCode: int, errorString: str, contract: Any) -> None:
+        if not sub.active:
+            return
+        if errorCode not in DEPTH_RELATED_ERROR_CODES:
+            return
+        if contract is None:
+            return
+        primary_conid = getattr(primary_contract, "conId", 0)
+        contract_conid = getattr(contract, "conId", 0)
+        if primary_conid and contract_conid:
+            same_contract = contract_conid == primary_conid
+        else:
+            same_contract = (
+                getattr(contract, "symbol", None)
+                == getattr(primary_contract, "symbol", None)
+            )
+        if not same_contract:
+            return
+        sub.active = False
+        message = f"IB rejected depth request: {errorString}"
+        writer.submit(
+            "depth",
+            depth_status_row(args.symbol, "error", message, str(errorCode)),
+        )
+        log.warning("Depth disabled: %s (code=%s)", message, errorCode)
+        try:
+            ib.cancelMktDepth(primary_contract, isSmartDepth=args.depth_smart)
+        except Exception:
+            pass
+
+    ib.errorEvent += on_ib_error
+    sub.error_handler = on_ib_error
+    return sub
+
+
+def _consume_l1_ticks(
+    l1: L1Subscription,
+    writer: CsvWriteWorker,
+    discount_threshold: float,
+) -> None:
+    """Forward any new L1 ticks since the last call to the writer."""
+    current = len(l1.ticker.ticks)
+    if current < l1.processed_count:
+        # ib_insync truncated the buffer; reset cursor to avoid skipping data.
+        log.debug(
+            "L1 ticks truncated (%d -> %d); resetting cursor",
+            l1.processed_count, current,
+        )
+        l1.processed_count = 0
+    if current <= l1.processed_count:
+        return
+    new_ticks = l1.ticker.ticks[l1.processed_count:current]
+    for tick in new_ticks:
+        row = update_market_state(l1.market_state, l1.ticker, tick)
+        if row is None:
+            continue
+        writer.submit("market", row)
+        ask_disc = row["ask_ib_nav_discount_bps"]
+        if ask_disc is not None and ask_disc <= discount_threshold:
+            log.warning(
+                "Discount alert: ask=%s ib_nav_last=%s ask_discount_bps=%.2f",
+                row["ask"], row["ib_nav_last"], ask_disc,
+            )
+    l1.processed_count = current
+
+
+def _consume_depth_ticks(
+    depth: DepthSubscription,
+    writer: CsvWriteWorker,
+    symbol: str,
+    startup_timeout: float,
+) -> None:
+    """Forward new depth ticks (or a one-shot warning if no data arrives)."""
+    if not depth.active:
+        return
+    current = len(depth.ticker.domTicks)
+    if current < depth.processed_count:
+        log.debug(
+            "Depth domTicks truncated (%d -> %d); resetting cursor",
+            depth.processed_count, current,
+        )
+        depth.processed_count = 0
+    if current > depth.processed_count:
+        new_ticks = depth.ticker.domTicks[depth.processed_count:current]
+        for depth_tick in new_ticks:
+            depth.last_update_at = isoformat_timestamp(getattr(depth_tick, "time", None))
+            writer.submit("depth", build_depth_row(symbol, depth.ticker, depth_tick))
+        depth.processed_count = current
+        return
+    if (
+        not depth.warned_no_data
+        and current == 0
+        and time.monotonic() - depth.started_at >= startup_timeout
+    ):
+        depth.warned_no_data = True
+        writer.submit(
+            "depth",
+            depth_status_row(
+                symbol,
+                "warning",
+                "No market depth updates received within startup timeout; "
+                "depth may be unavailable, closed, or not entitled.",
+            ),
+        )
+        log.warning("Depth: no updates within startup timeout (%.1fs)", startup_timeout)
+
+
+def _emit_sync_snapshots(
+    poller: IceInavPoller,
+    writer: CsvWriteWorker,
+    symbol: str,
+    l1: L1Subscription,
+    depth: DepthSubscription | None,
+) -> None:
+    """Pair each new official iNAV row with current IB state and write a sync row."""
+    for official_row in poller.drain():
+        sync_row = build_sync_snapshot_row(
+            symbol,
+            official_row,
+            l1.market_state,
+            depth.ticker if depth is not None else None,
+            depth.active if depth is not None else False,
+            depth.last_update_at if depth is not None else None,
+        )
+        writer.submit("sync", sync_row)
+        log_official_snapshot(official_row)
+
+
+# ===========================================================================
+# Session lifecycle
+# ===========================================================================
+
+def run_session(ib: IB, args: argparse.Namespace, writer: CsvWriteWorker) -> None:
+    """Subscribe and pump market data until disconnect or KeyboardInterrupt.
+
+    Returns normally on KeyboardInterrupt. Raises ConnectionError if the IB
+    connection is lost mid-session so the outer loop can reconnect.
+    """
+    primary_contract = qualify_primary_contract(ib, args)
+
+    l1_ticker = ib.reqMktData(
+        primary_contract,
+        genericTickList=DEFAULT_GENERIC_TICKS,
+        snapshot=False,
+    )
+    l1 = L1Subscription(
+        ticker=l1_ticker,
+        market_state=blank_market_state(args.symbol),
+    )
+
+    depth: DepthSubscription | None = None
+    if args.with_depth:
+        depth = subscribe_depth(ib, primary_contract, args, writer)
+
+    poller = IceInavPoller(
+        symbol=args.symbol,
+        language=args.official_inav_language,
+        interval=args.official_inav_interval,
+        writer=writer,
+        request_timeout=args.official_inav_timeout,
+    )
+    poller.start()
+
+    log.info("Subscribed to %s on %s (%s)", args.symbol, args.exchange, args.currency)
+    log.info(
+        "Recording official ICE iNAV every %.1fs (timeout=%.1fs)",
+        args.official_inav_interval, args.official_inav_timeout,
+    )
+    if args.with_depth:
+        log.info(
+            "Market depth subscription requested (rows=%d smart=%s)",
+            max(1, min(args.depth_rows, 5)), args.depth_smart,
+        )
+    log.info("Press Ctrl+C to stop.")
+
+    discount_threshold = -abs(args.discount_threshold_bps)
+
+    try:
+        while True:
+            if not ib.isConnected():
+                raise ConnectionError("IB Gateway disconnected")
+            ib.waitOnUpdate(timeout=args.ib_wait_seconds)
+            _consume_l1_ticks(l1, writer, discount_threshold)
+            if depth is not None:
+                _consume_depth_ticks(
+                    depth, writer, args.symbol, args.depth_startup_timeout
+                )
+            _emit_sync_snapshots(poller, writer, args.symbol, l1, depth)
+    finally:
+        poller.stop()
+        if depth is not None and depth.error_handler is not None:
+            try:
+                ib.errorEvent -= depth.error_handler
+            except Exception:
+                pass
+        if depth is not None:
+            try:
+                ib.cancelMktDepth(depth.contract, isSmartDepth=depth.is_smart)
+            except Exception:
+                pass
+        try:
+            ib.cancelMktData(l1_ticker.contract)
+        except Exception:
+            pass
+
+
+def run_forever(args: argparse.Namespace, writer: CsvWriteWorker) -> None:
+    """Outer loop that handles connection lifecycle and reconnects on failure."""
+    attempt = 0
+    while True:
+        ib = IB()
+        try:
+            log.info(
+                "Connecting to IB at %s:%s (clientId=%d)...",
+                args.host, args.port, args.client_id,
+            )
+            ib.connect(args.host, args.port, clientId=args.client_id)
+            attempt = 0  # success resets backoff
+            log.info("IB connected.")
+            if not args.skip_probe:
+                log.info("Running IB NAV probe for the configured ETF list...")
+                probe_ib_nav_capabilities(ib, args, writer)
+            run_session(ib, args, writer)
+            return  # session ended cleanly
+        except KeyboardInterrupt:
+            log.info("Stopped by user.")
+            return
+        except Exception as exc:
+            if args.no_reconnect:
+                log.error("Session failed: %s. --no-reconnect set; exiting.", exc)
+                return
+            delay = compute_backoff(
+                attempt, base=args.reconnect_base, cap=args.reconnect_cap
+            )
+            attempt += 1
+            log.warning(
+                "Session failed: %s. Reconnecting in %.1fs (attempt %d).",
+                exc, delay, attempt,
+            )
+            try:
+                time.sleep(delay)
+            except KeyboardInterrupt:
+                log.info("Stopped by user during backoff.")
+                return
+        finally:
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
 
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = args.log_file if args.log_file is not None else args.output_dir / "etf_monitor.log"
+    setup_logging(args.log_level, log_file)
+    log.info(
+        "Starting ETF monitor for symbol=%s output_dir=%s log_file=%s",
+        args.symbol, args.output_dir.resolve(), log_file.resolve(),
+    )
 
     market_output_path = args.output_dir / f"{args.symbol}_ib_ticks.csv"
     probe_output_path = args.output_dir / "ib_nav_probe.csv"
@@ -802,172 +1339,11 @@ def main() -> None:
         flush_interval=args.writer_flush_interval,
     )
     writer.start()
-
-    ib = IB()
-    ib.connect(args.host, args.port, clientId=args.client_id)
-
-    l1_ticker: Ticker | None = None
-    depth_ticker: Ticker | None = None
-    depth_active = False
-    depth_error_handler = None
-    primary_contract = None
     try:
-        if not args.skip_probe:
-            print("Running IB NAV probe for the configured ETF list...")
-            probe_ib_nav_capabilities(ib, args, writer)
-            print(f"Saved probe results to {probe_output_path.resolve()}")
-
-        primary_contract = qualify_primary_contract(ib, args)
-        l1_ticker = ib.reqMktData(
-            primary_contract,
-            genericTickList="577,614,623",
-            snapshot=False,
-        )
-
-        depth_req_id = None
-        if args.with_depth:
-            try:
-                depth_ticker = ib.reqMktDepth(
-                    primary_contract,
-                    numRows=max(1, min(args.depth_rows, 5)),
-                    isSmartDepth=args.depth_smart,
-                )
-                depth_req_id = ib.wrapper.ticker2ReqId["mktDepth"].get(depth_ticker)
-                depth_active = True
-                writer.submit(
-                    "depth",
-                    depth_status_row(
-                        args.symbol,
-                        "subscribed",
-                        f"Depth subscription started with rows={max(1, min(args.depth_rows, 5))}, smart={args.depth_smart}",
-                    ),
-                )
-
-                def on_ib_error(reqId: int, errorCode: int, errorString: str, contract: Any) -> None:
-                    nonlocal depth_active
-                    if not depth_active or reqId != depth_req_id:
-                        return
-                    depth_active = False
-                    message = f"IB rejected depth request: {errorString}"
-                    writer.submit("depth", depth_status_row(args.symbol, "error", message, str(errorCode)))
-                    print(f"Depth disabled: {message} (code={errorCode})")
-                    try:
-                        ib.cancelMktDepth(primary_contract, isSmartDepth=args.depth_smart)
-                    except Exception:
-                        pass
-
-                depth_error_handler = on_ib_error
-                ib.errorEvent += depth_error_handler
-            except Exception as exc:
-                depth_active = False
-                writer.submit(
-                    "depth",
-                    depth_status_row(
-                        args.symbol,
-                        "error",
-                        f"Depth subscription failed: {type(exc).__name__}: {exc}",
-                    ),
-                )
-                print(f"Depth disabled: {type(exc).__name__}: {exc}")
-
-        print(f"Recording IB tick-level top-of-book updates to {market_output_path.resolve()}")
-        print(f"Recording official ICE iNAV snapshots to {official_inav_output_path.resolve()}")
-        print(f"Recording synchronized snapshots to {sync_snapshot_output_path.resolve()}")
-        if args.with_depth:
-            print(f"Recording IB market depth updates to {depth_output_path.resolve()}")
-        print("Press Ctrl+C to stop.")
-
-        market_state = blank_market_state(args.symbol)
-        processed_tick_count = 0
-        processed_dom_tick_count = 0
-        last_official_inav_poll = 0.0
-        discount_threshold = -abs(args.discount_threshold_bps)
-        depth_warned_no_data = False
-        depth_started_at = time.monotonic()
-        l2_last_update_at: str | None = None
-
-        while True:
-            ib.waitOnUpdate(timeout=args.ib_wait_seconds)
-
-            if l1_ticker is not None:
-                current_tick_count = len(l1_ticker.ticks)
-                if current_tick_count > processed_tick_count:
-                    new_ticks = l1_ticker.ticks[processed_tick_count:current_tick_count]
-                    for tick in new_ticks:
-                        row = update_market_state(market_state, l1_ticker, tick)
-                        if row is None:
-                            continue
-
-                        writer.submit("market", row)
-                        ask_discount = row["ask_ib_nav_discount_bps"]
-                        if ask_discount is not None and ask_discount <= discount_threshold:
-                            print(
-                                f"{row['received_at']} ask={row['ask']} ib_nav_last={row['ib_nav_last']} "
-                                f"ask_discount_bps={ask_discount:.2f}"
-                            )
-
-                    processed_tick_count = current_tick_count
-
-            if args.with_depth and depth_active and depth_ticker is not None:
-                current_dom_tick_count = len(depth_ticker.domTicks)
-                if current_dom_tick_count > processed_dom_tick_count:
-                    new_dom_ticks = depth_ticker.domTicks[processed_dom_tick_count:current_dom_tick_count]
-                    for depth_tick in new_dom_ticks:
-                        l2_last_update_at = isoformat_timestamp(getattr(depth_tick, "time", None))
-                        writer.submit("depth", build_depth_row(args.symbol, depth_ticker, depth_tick))
-                    processed_dom_tick_count = current_dom_tick_count
-                elif (
-                    not depth_warned_no_data
-                    and current_dom_tick_count == 0
-                    and time.monotonic() - depth_started_at >= args.depth_startup_timeout
-                ):
-                    depth_warned_no_data = True
-                    writer.submit(
-                        "depth",
-                        depth_status_row(
-                            args.symbol,
-                            "warning",
-                            "No market depth updates received within startup timeout; depth may be unavailable, closed, or not entitled.",
-                        ),
-                    )
-                    print("Depth warning: no market depth updates received within startup timeout.")
-
-            now = time.monotonic()
-            if now - last_official_inav_poll >= args.official_inav_interval:
-                try:
-                    payload = fetch_official_inav(args.symbol, args.official_inav_language)
-                    official_row = flatten_official_inav(args.symbol, payload)
-                except Exception as exc:
-                    official_row = official_inav_error_row(args.symbol, f"{type(exc).__name__}: {exc}")
-
-                writer.submit("official", official_row)
-                writer.submit(
-                    "sync",
-                    build_sync_snapshot_row(
-                        args.symbol,
-                        official_row,
-                        market_state,
-                        depth_ticker,
-                        depth_active,
-                        l2_last_update_at,
-                    ),
-                )
-                print_official_snapshot(official_row)
-                last_official_inav_poll = now
-    except KeyboardInterrupt:
-        print("Stopped by user.")
+        run_forever(args, writer)
     finally:
-        if depth_error_handler is not None:
-            ib.errorEvent -= depth_error_handler
-        if args.with_depth and primary_contract is not None:
-            try:
-                ib.cancelMktDepth(primary_contract, isSmartDepth=args.depth_smart)
-            except Exception:
-                pass
-        if l1_ticker is not None:
-            ib.cancelMktData(l1_ticker.contract)
-        ib.disconnect()
         writer.close()
+        log.info("ETF monitor stopped.")
 
 
 if __name__ == "__main__":

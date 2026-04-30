@@ -4,3 +4,7 @@ test_*.py
 .venv/
 
 .vscode/
+
+# J_PBR caches: regeneratable from yfinance, kept locally to speed up re-runs
+J_PBR/data/cache_info/
+J_PBR/data/cache_history/
