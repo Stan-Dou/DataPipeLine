@@ -103,6 +103,14 @@ class IndexDAO:
         )
         self.conn.commit()
 
+    def upsert_index(self, index_code: str, index_name: str):
+        """注册或更新指数信息"""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO indices VALUES (?,?)",
+            (index_code, index_name)
+        )
+        self.conn.commit()
+
     # ── 行情数据 ──
 
     def upsert_daily(self, record: IndexRecord) -> bool:
